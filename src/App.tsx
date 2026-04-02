@@ -1,9 +1,5 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
-import {
-  sqlite3Worker1Promiser as sqlite3Worker1PromiserFactory,
-  type Worker1Promiser,
-} from '@sqlite.org/sqlite-wasm'
 import './App.css'
 
 type SqlCell =
@@ -17,59 +13,85 @@ type SqlCell =
 
 type ResultRow = Record<string, SqlCell>
 
-type ExecutionSummary = {
-  changeCount: string | null
-  columns: string[]
-  elapsedMs: number
-  lastInsertRowId: string | null
-  rowCount: number
-  rows: ResultRow[]
-  sql: string
+type StorageMode = 'memory' | 'opfs' | 'opfs-sahpool'
+
+type InitPayload = {
+  bootstrapSql: string
+  filename: string
 }
 
-type ConnectionState = {
-  crossOriginIsolated: boolean
-  dbId: string
+type InitResult = {
+  diagnostics: string[]
   filename: string
   persistent: boolean
+  storageDetail: string | null
+  storageMode: StorageMode
   version: string
   vfs: string
   vfsList: string[]
 }
 
-type WorkerResponseMap = {
-  'config-get': {
-    result: {
-      version: {
-        libVersion: string
-      }
-      vfsList: string[]
-    }
-  }
-  close: {
-    result: {
-      filename?: string
-    }
-  }
-  exec: {
-    result: {
-      changeCount?: bigint | number
-      lastInsertRowId?: bigint | number
-      resultRows?: ResultRow[]
-    }
-  }
-  open: {
-    dbId?: string
-    result: {
-      dbId: string
-      filename: string
-      persistent: boolean
-      vfs: string
-    }
-  }
+type ExecPayload = {
+  sql: string
 }
 
-const DB_URI = 'file:opfs-demo.db?vfs=opfs'
+type ExecResult = {
+  changeCount: number
+  columns: string[]
+  elapsedMs: number
+  lastInsertRowId: bigint | null
+  rowCount: number
+  rows: ResultRow[]
+}
+
+type ConnectionState = InitResult & {
+  crossOriginIsolated: boolean
+}
+
+type ExecutionSummary = ExecResult & {
+  sql: string
+}
+
+type WorkerRequestMap = {
+  close: Record<string, never>
+  exec: ExecPayload
+  init: InitPayload
+}
+
+type WorkerResponseMap = {
+  close: {
+    closed: boolean
+  }
+  exec: ExecResult
+  init: InitResult
+}
+
+type WorkerRequest<K extends keyof WorkerRequestMap> = {
+  id: number
+  payload: WorkerRequestMap[K]
+  type: K
+}
+
+type WorkerSuccess<K extends keyof WorkerResponseMap> = {
+  id: number
+  result: WorkerResponseMap[K]
+  success: true
+}
+
+type WorkerFailure = {
+  error: string
+  id: number
+  success: false
+}
+
+type SqliteWorkerClient = {
+  close: () => Promise<WorkerResponseMap['close']>
+  exec: (payload: ExecPayload) => Promise<ExecResult>
+  init: (payload: InitPayload) => Promise<InitResult>
+  terminate: () => void
+}
+
+const DB_FILENAME = 'opfs-demo.db'
 
 const BOOTSTRAP_SQL = `
   CREATE TABLE IF NOT EXISTS demo_tasks (
@@ -121,22 +143,6 @@ const EXAMPLES = [
   },
 ]
 
-function normalizeFileName(filename: string) {
-  return filename.replace(/^file:/, '').replace(/\?vfs=.*$/, '')
-}
-
-function formatMaybeBigInt(value: bigint | number | undefined) {
-  if (typeof value === 'bigint') {
-    return value.toString()
-  }
-
-  if (typeof value === 'number') {
-    return String(value)
-  }
-
-  return null
-}
-
 function formatCell(value: SqlCell) {
   if (value === null) {
     return 'NULL'
@@ -157,103 +163,117 @@ function formatCell(value: SqlCell) {
   return String(value)
 }
 
+function formatStorageMode(mode: StorageMode) {
+  switch (mode) {
+    case 'opfs':
+      return 'OPFS'
+    case 'opfs-sahpool':
+      return 'OPFS SAH pool'
+    case 'memory':
+      return 'Memory'
+  }
+}
+
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
     return error.message
   }
 
-  if (typeof error === 'object' && error !== null && 'result' in error) {
-    const result = Reflect.get(error, 'result')
-
-    if (typeof result === 'object' && result !== null && 'message' in result) {
-      const message = Reflect.get(result, 'message')
-
-      if (typeof message === 'string') {
-        return message
-      }
-    }
-  }
-
   return String(error)
 }
 
-async function createPromiser() {
-  return await new Promise<Worker1Promiser>((resolve, reject) => {
-    try {
-      ;(
-        sqlite3Worker1PromiserFactory as unknown as (config: {
-          onready: (promiser: Worker1Promiser) => void
-        }) => Worker1Promiser
-      )({
-        onready: resolve,
-      })
-    } catch (error) {
-      reject(error)
+function createSqliteWorkerClient(): SqliteWorkerClient {
+  const worker = new Worker(new URL('./sqlite-worker.ts', import.meta.url), {
+    type: 'module',
+  })
+  let nextId = 1
+  const pending = new Map<
+    number,
+    {
+      reject: (error: Error) => void
+      resolve: (value: unknown) => void
     }
-  })
-}
+  >()
 
-async function workerMessage(
-  promiser: Worker1Promiser,
-  type: 'config-get',
-): Promise<WorkerResponseMap['config-get']>
-async function workerMessage(
-  promiser: Worker1Promiser,
-  type: 'close',
-): Promise<WorkerResponseMap['close']>
-async function workerMessage(
-  promiser: Worker1Promiser,
-  type: 'exec',
-  args: Record<string, unknown>,
-): Promise<WorkerResponseMap['exec']>
-async function workerMessage(
-  promiser: Worker1Promiser,
-  type: 'open',
-  args: Record<string, unknown>,
-): Promise<WorkerResponseMap['open']>
-async function workerMessage(
-  promiser: Worker1Promiser,
-  type: 'config-get' | 'close' | 'exec' | 'open',
-  args?: Record<string, unknown>,
-) {
-  return await (
-    promiser as unknown as (
-      type: 'config-get' | 'close' | 'exec' | 'open',
-      args: Record<string, unknown>,
-    ) => Promise<WorkerResponseMap[typeof type]>
-  )(type, args ?? {})
-}
+  const rejectAll = (message: string) => {
+    for (const { reject } of pending.values()) {
+      reject(new Error(message))
+    }
 
-async function executeSql(promiser: Worker1Promiser, sql: string) {
-  const startedAt = performance.now()
-  const response = await workerMessage(promiser, 'exec', {
-    returnValue: 'resultRows',
-    resultRows: [],
-    rowMode: 'object',
-    sql,
+    pending.clear()
+  }
+
+  worker.addEventListener('message', (event) => {
+    const message = event.data as
+      | WorkerSuccess<keyof WorkerResponseMap>
+      | WorkerFailure
+    const current = pending.get(message.id)
+
+    if (!current) {
+      return
+    }
+
+    pending.delete(message.id)
+
+    if (message.success) {
+      current.resolve(message.result)
+      return
+    }
+
+    current.reject(new Error(message.error))
   })
-  const rows = (response.result.resultRows ?? []) as ResultRow[]
-  const columns = rows.length > 0 ? Object.keys(rows[0]) : []
+
+  worker.addEventListener('error', (event) => {
+    rejectAll(event.message || 'SQLite worker crashed.')
+  })
+
+  const request = <K extends keyof WorkerRequestMap>(
+    type: K,
+    payload: WorkerRequestMap[K],
+  ) =>
+    new Promise<WorkerResponseMap[K]>((resolve, reject) => {
+      const id = nextId++
+
+      pending.set(id, {
+        reject,
+        resolve: (value) => resolve(value as WorkerResponseMap[K]),
+      })
+
+      worker.postMessage({
+        id,
+        payload,
+        type,
+      } satisfies WorkerRequest<K>)
+    })
 
   return {
-    changeCount: formatMaybeBigInt(response.result.changeCount),
-    columns,
-    elapsedMs: performance.now() - startedAt,
-    lastInsertRowId: formatMaybeBigInt(response.result.lastInsertRowId),
-    rowCount: rows.length,
-    rows,
+    close: () => request('close', {}),
+    exec: (payload) => request('exec', payload),
+    init: (payload) => request('init', payload),
+    terminate: () => {
+      rejectAll('SQLite worker terminated.')
+      worker.terminate()
+    },
+  }
+}
+
+async function executeSql(client: SqliteWorkerClient, sql: string) {
+  const result = await client.exec({ sql })
+
+  return {
+    ...result,
     sql,
   } satisfies ExecutionSummary
 }
 
 function App() {
+  const [client, setClient] = useState<SqliteWorkerClient | null>(null)
   const [connection, setConnection] = useState<ConnectionState | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [execution, setExecution] = useState<ExecutionSummary | null>(null)
   const [isBooting, setIsBooting] = useState(true)
   const [isRunning, setIsRunning] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
-  const [promiser, setPromiser] = useState<Worker1Promiser | null>(null)
   const [query, setQuery] = useState(DEFAULT_QUERY)
 
   const pushLog = (message: string) => {
@@ -266,13 +286,13 @@ function App() {
     setLogs((current) => [`${stamp} ${message}`, ...current].slice(0, 8))
   }
 
-  const runQuery = async (sql: string, activePromiser: Worker1Promiser) => {
+  const runQuery = async (sql: string, activeClient: SqliteWorkerClient) => {
     setIsRunning(true)
     setErrorMessage(null)
     pushLog(`Running SQL: ${sql.split('\n')[0]?.trim() || 'statement'}`)
 
     try {
-      const summary = await executeSql(activePromiser, sql)
+      const summary = await executeSql(activeClient, sql)
       setExecution(summary)
       pushLog(
         `Completed in ${summary.elapsedMs.toFixed(1)} ms with ${summary.rowCount} row${summary.rowCount === 1 ? '' : 's'}.`,
@@ -288,7 +308,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false
-    let workerPromiser: Worker1Promiser | null = null
+    const nextClient = createSqliteWorkerClient()
 
     const appendLog = (message: string) => {
       const stamp = new Date().toLocaleTimeString([], {
@@ -305,46 +325,27 @@ function App() {
       appendLog('Initializing the SQLite worker.')
 
       try {
-        workerPromiser = await createPromiser()
-
-        if (cancelled) {
-          return
-        }
-
-        setPromiser(() => workerPromiser)
-
-        const config = await workerMessage(workerPromiser, 'config-get')
-        const open = await workerMessage(workerPromiser, 'open', {
-          filename: DB_URI,
-        })
-
-        await workerMessage(workerPromiser, 'exec', {
-          sql: BOOTSTRAP_SQL,
+        const init = await nextClient.init({
+          bootstrapSql: BOOTSTRAP_SQL,
+          filename: DB_FILENAME,
         })
 
         if (cancelled) {
           return
         }
 
+        setClient(nextClient)
         setConnection({
+          ...init,
           crossOriginIsolated: window.crossOriginIsolated,
-          dbId:
-            typeof Reflect.get(open, 'dbId') === 'string'
-              ? (Reflect.get(open, 'dbId') as string)
-              : open.result.dbId,
-          filename: normalizeFileName(open.result.filename),
-          persistent: open.result.persistent,
-          version: config.result.version.libVersion,
-          vfs: open.result.vfs,
-          vfsList: config.result.vfsList,
         })
 
         appendLog(
-          `Opened ${normalizeFileName(open.result.filename)} with ${open.result.vfs}.`,
+          `Opened ${init.filename} using ${formatStorageMode(init.storageMode)} (${init.vfs}).`,
         )
 
         setIsRunning(true)
-        const initialExecution = await executeSql(workerPromiser, DEFAULT_QUERY)
+        const initialExecution = await executeSql(nextClient, DEFAULT_QUERY)
 
         if (cancelled) {
           return
@@ -374,21 +375,19 @@ function App() {
 
     return () => {
       cancelled = true
-
-      if (workerPromiser) {
-        void workerMessage(workerPromiser, 'close').catch(() => undefined)
-      }
+      void nextClient.close().catch(() => undefined)
+      nextClient.terminate()
     }
   }, [])
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
-    if (!promiser) {
+    if (!client) {
       return
     }
 
-    await runQuery(query, promiser)
+    await runQuery(query, client)
   }
 
   const handleEditorKeyDown = async (
@@ -397,8 +396,8 @@ function App() {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
       event.preventDefault()
 
-      if (promiser) {
-        await runQuery(query, promiser)
+      if (client) {
+        await runQuery(query, client)
       }
     }
   }
@@ -411,8 +410,9 @@ function App() {
           <h1>Browser-persisted SQL on top of Origin Private File System</h1>
           <p className="lede">
             A compact query runner for a worker-backed SQLite database stored in
-            <code> {normalizeFileName(DB_URI)} </code>
-            so data survives page reloads.
+            <code> {DB_FILENAME} </code>
+            so data survives page reloads, with automatic fallback to the OPFS
+            SAH pool on browsers without `SharedArrayBuffer`.
           </p>
         </div>
         <div className="meta-grid">
@@ -420,27 +420,29 @@ function App() {
             <span className="meta-label">Engine</span>
             <strong>{connection?.version ?? 'Starting...'}</strong>
             <span className="meta-hint">
-              {connection
-                ? `${connection.vfs} VFS`
-                : 'Worker1 promiser boot sequence'}
+              {connection ? `${connection.vfs} VFS` : 'Worker boot sequence'}
             </span>
           </article>
           <article className="meta-card">
             <span className="meta-label">Storage</span>
-            <strong>{connection?.persistent ? 'Persistent' : 'Pending'}</strong>
+            <strong>
+              {connection ? formatStorageMode(connection.storageMode) : 'Pending'}
+            </strong>
             <span className="meta-hint">
-              {connection ? connection.filename : 'Waiting for open()'}
+              {connection?.persistent
+                ? `${connection.filename} persists across reloads`
+                : 'In-memory fallback'}
             </span>
           </article>
           <article className="meta-card">
             <span className="meta-label">Isolation</span>
             <strong>
-              {connection?.crossOriginIsolated ? 'COOP/COEP on' : 'Checking'}
+              {connection?.crossOriginIsolated ? 'COOP/COEP on' : 'Fallback-safe'}
             </strong>
             <span className="meta-hint">
               {connection?.crossOriginIsolated
-                ? 'SharedArrayBuffer path is available.'
-                : 'Vite serves the required headers in dev and preview.'}
+                ? 'Regular OPFS path can use SharedArrayBuffer.'
+                : 'SAH pool can still keep OPFS persistence.'}
             </span>
           </article>
         </div>
@@ -451,7 +453,7 @@ function App() {
           <div className="panel-head">
             <div>
               <p className="panel-kicker">Query Runner</p>
-              <h2>Run SQL against the OPFS database</h2>
+              <h2>Run SQL against the persistent database</h2>
             </div>
             <div className="panel-actions">
               {EXAMPLES.map((example) => (
@@ -481,13 +483,13 @@ function App() {
               <div className="toolbar-copy">
                 <span>Run with Ctrl/Cmd + Enter.</span>
                 <span>
-                  Current database id: <code>{connection?.dbId ?? 'loading'}</code>
+                  Mode: <code>{connection ? formatStorageMode(connection.storageMode) : 'loading'}</code>
                 </span>
               </div>
               <button
                 className="primary-button"
                 type="submit"
-                disabled={!promiser || isBooting || isRunning}
+                disabled={!client || isBooting || isRunning}
               >
                 {isBooting ? 'Starting...' : isRunning ? 'Running...' : 'Run SQL'}
               </button>
@@ -518,7 +520,11 @@ function App() {
             </div>
             <div>
               <span className="result-label">Last insert rowid</span>
-              <strong>{execution?.lastInsertRowId ?? 'n/a'}</strong>
+              <strong>
+                {execution?.lastInsertRowId != null
+                  ? execution.lastInsertRowId.toString()
+                  : 'n/a'}
+              </strong>
             </div>
           </div>
 
@@ -581,12 +587,16 @@ function App() {
                   <dd>{connection?.filename ?? 'Opening...'}</dd>
                 </div>
                 <div>
-                  <dt>Primary VFS</dt>
+                  <dt>Selected VFS</dt>
                   <dd>{connection?.vfs ?? '...'}</dd>
                 </div>
                 <div>
-                  <dt>Persistent storage</dt>
-                  <dd>{connection?.persistent ? 'yes' : 'not yet'}</dd>
+                  <dt>Storage mode</dt>
+                  <dd>
+                    {connection
+                      ? formatStorageMode(connection.storageMode)
+                      : 'Starting...'}
+                  </dd>
                 </div>
                 <div>
                   <dt>Known VFS list</dt>
@@ -596,16 +606,32 @@ function App() {
             </section>
 
             <section className="subpanel">
-              <p className="panel-kicker">Notes</p>
-              <h2>Why the headers matter</h2>
+              <p className="panel-kicker">Fallback</p>
+              <h2>Persistence behavior</h2>
               <p className="body-copy">
-                SQLite&apos;s OPFS path depends on worker-side capabilities gated
-                behind cross-origin isolation. The Vite config serves
-                <code> Cross-Origin-Opener-Policy: same-origin </code>
-                and
-                <code> Cross-Origin-Embedder-Policy: require-corp </code>
-                in both dev and preview mode.
+                The worker prefers the standard
+                <code> opfs </code>
+                VFS when available. If that VFS is missing, it attempts to
+                install and use
+                <code> opfs-sahpool </code>
+                so OPFS persistence still works on browsers that do not expose
+                `SharedArrayBuffer`.
               </p>
+              {connection?.storageDetail ? (
+                <p className="body-copy">{connection.storageDetail}</p>
+              ) : null}
+            </section>
+
+            <section className="subpanel">
+              <p className="panel-kicker">Diagnostics</p>
+              <h2>Worker capability report</h2>
+              <ul className="log-list">
+                {(connection?.diagnostics ?? ['Loading worker diagnostics...']).map(
+                  (entry) => (
+                    <li key={entry}>{entry}</li>
+                  ),
+                )}
+              </ul>
             </section>
           </div>
         </aside>
