@@ -1,0 +1,97 @@
+:root {
+  color: #39271c;
+  background:
+    radial-gradient(circle at top left, rgba(255, 219, 172, 0.65), transparent 30%),
+    radial-gradient(circle at top right, rgba(166, 82, 30, 0.14), transparent 22%),
+    linear-gradient(180deg, #fff9f1 0%, #f2e4d3 100%);
+  font-family: Georgia, 'Iowan Old Style', 'Palatino Linotype', serif;
+  font-synthesis: none;
+  line-height: 1.5;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --accent: #a6521e;
+  --copy: rgba(57, 39, 28, 0.82);
+  --copy-strong: #2b1a12;
+  --heading: #1f130d;
+  --muted: rgba(80, 57, 40, 0.68);
+  --font-mono:
+    'SFMono-Regular', 'SF Mono', 'Cascadia Code', 'Roboto Mono', Consolas,
+    monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.18), transparent 30%),
+    repeating-linear-gradient(
+      90deg,
+      rgba(129, 87, 55, 0.04) 0,
+      rgba(129, 87, 55, 0.04) 1px,
+      transparent 1px,
+      transparent 88px
+    );
+  opacity: 0.75;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  max-width: 18ch;
+  font-size: clamp(1.65rem, 3vw, 2.5rem);
+  line-height: 1.02;
+  letter-spacing: -0.035em;
+  color: var(--heading);
+}
+
+h2 {
+  font-size: 1.05rem;
+  color: var(--heading);
+}
+
+#root {
+  position: relative;
+  max-width: 1220px;
+  margin: 0 auto;
+  padding: 1.2rem;
+}
+
+@media (max-width: 640px) {
+  #root {
+    padding: 0.8rem;
+  }
+}
