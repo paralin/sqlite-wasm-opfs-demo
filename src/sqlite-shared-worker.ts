@@ -2,85 +2,18 @@ import sqlite3InitModule, {
   type Database,
   type SAHPoolUtil,
 } from '@sqlite.org/sqlite-wasm'
-
-type SqlCell =
-  | string
-  | number
-  | bigint
-  | null
-  | Uint8Array
-  | Int8Array
-  | ArrayBuffer
-
-type ResultRow = Record<string, SqlCell>
-
-type StorageMode = 'memory' | 'opfs' | 'opfs-sahpool'
-
-type InitPayload = {
-  bootstrapSql: string
-  filename: string
-}
-
-type InitResult = {
-  diagnostics: string[]
-  filename: string
-  persistent: boolean
-  storageDetail: string | null
-  storageMode: StorageMode
-  version: string
-  vfs: string
-  vfsList: string[]
-}
-
-type ExecPayload = {
-  sql: string
-}
-
-type ExecResult = {
-  changeCount: number
-  columns: string[]
-  elapsedMs: number
-  lastInsertRowId: bigint | null
-  rowCount: number
-  rows: ResultRow[]
-}
-
-type WorkerRequestMap = {
-  close: Record<string, never>
-  exec: ExecPayload
-  init: InitPayload
-}
-
-type WorkerResponseMap = {
-  close: {
-    closed: boolean
-  }
-  exec: ExecResult
-  init: InitResult
-}
-
-type WorkerRequest<K extends keyof WorkerRequestMap> = {
-  id: number
-  payload: WorkerRequestMap[K]
-  type: K
-}
-
-type WorkerSuccess<K extends keyof WorkerResponseMap> = {
-  id: number
-  result: WorkerResponseMap[K]
-  success: true
-}
-
-type WorkerFailure = {
-  error: string
-  id: number
-  success: false
-}
-
-type WorkerIncoming =
-  | WorkerRequest<'close'>
-  | WorkerRequest<'exec'>
-  | WorkerRequest<'init'>
+import type {
+  ExecPayload,
+  ExecResult,
+  InitPayload,
+  InitResult,
+  ResultRow,
+  SqliteFailure,
+  SqliteIncoming,
+  SqliteResponseMap,
+  SqliteSuccess,
+  StorageMode,
+} from './sqlite-protocol'
 
 type SqliteApi = Awaited<ReturnType<typeof sqlite3InitModule>>
 
@@ -93,16 +26,20 @@ type FileHandleWithSyncAccess = FileSystemFileHandle & {
 }
 
 let activeDb: Database | null = null
+let activeFilename: string | null = null
 let activeVfs = ''
 let sqlite3ApiPromise: Promise<SqliteApi> | null = null
 let storageDetail: string | null = null
 let storageMode: StorageMode = 'memory'
 let sahPoolPromise: Promise<SAHPoolUtil> | null = null
+let requestQueue = Promise.resolve()
+const connectedPorts = new Set<MessagePort>()
 
 async function collectOpfsDiagnostics() {
   const fileHandlePrototype = globalThis.FileSystemFileHandle
     ?.prototype as { createSyncAccessHandle?: unknown } | undefined
   const lines = [
+    'runtime=shared-worker',
     `worker=${typeof self !== 'undefined'}`,
     `isSecureContext=${String(globalThis.isSecureContext ?? false)}`,
     `sharedArrayBuffer=${typeof SharedArrayBuffer !== 'undefined'}`,
@@ -114,6 +51,7 @@ async function collectOpfsDiagnostics() {
     `FileSystemDirectoryHandle=${typeof globalThis.FileSystemDirectoryHandle !== 'undefined'}`,
     `FileSystemFileHandle=${typeof globalThis.FileSystemFileHandle !== 'undefined'}`,
     `createSyncAccessHandle=${typeof fileHandlePrototype?.createSyncAccessHandle === 'function'}`,
+    `connectedClients=${connectedPorts.size}`,
   ]
 
   if (typeof navigator?.userAgent === 'string') {
@@ -212,6 +150,7 @@ function closeDatabase() {
 
   activeDb.close()
   activeDb = null
+  activeFilename = null
   return true
 }
 
@@ -221,48 +160,59 @@ async function initializeDatabase({
 }: InitPayload): Promise<InitResult> {
   const sqlite3 = await getSqliteApi()
   const diagnostics = await collectOpfsDiagnostics()
-  closeDatabase()
 
-  const hasOpfsVfs = Boolean(sqlite3.capi.sqlite3_vfs_find('opfs'))
-  storageDetail = null
+  if (!activeDb || activeFilename !== filename) {
+    closeDatabase()
 
-  if (hasOpfsVfs) {
-    activeVfs = 'opfs'
-    storageMode = 'opfs'
-    activeDb = new sqlite3.oo1.DB({
-      filename,
-      flags: 'ct',
-      vfs: activeVfs,
-    })
-  } else {
-    try {
-      await normalizeMissingOpfsGlobals().catch((error) => {
-        diagnostics.push(`normalizeGlobalsError=${getErrorMessage(error)}`)
+    const hasOpfsVfs = Boolean(sqlite3.capi.sqlite3_vfs_find('opfs'))
+    storageDetail = null
+
+    if (hasOpfsVfs) {
+      activeVfs = 'opfs'
+      storageMode = 'opfs'
+      activeDb = new sqlite3.oo1.DB({
+        filename,
+        flags: 'ct',
+        vfs: activeVfs,
       })
-      diagnostics.push(...(await collectOpfsDiagnostics()).map((line) => `postNormalize:${line}`))
-      const poolUtil = await getSahPool(sqlite3)
-      activeVfs = 'opfs-sahpool'
-      storageMode = 'opfs-sahpool'
-      storageDetail =
-        'SharedArrayBuffer-backed OPFS was unavailable, so the worker installed SQLite’s OPFS SAH pool VFS instead.'
-      activeDb = new poolUtil.OpfsSAHPoolDb(toSahPoolPath(filename))
-    } catch (error) {
-      activeVfs = 'memdb'
-      storageMode = 'memory'
-      storageDetail =
-        'Both OPFS VFS options were unavailable. Falling back to an in-memory database for this session. ' +
-        getErrorMessage(error)
-      diagnostics.push(`sahpoolError=${getErrorMessage(error)}`)
-      activeDb = new sqlite3.oo1.DB(':memory:', 'ct')
+    } else {
+      try {
+        await normalizeMissingOpfsGlobals().catch((error) => {
+          diagnostics.push(`normalizeGlobalsError=${getErrorMessage(error)}`)
+        })
+        diagnostics.push(
+          ...(await collectOpfsDiagnostics()).map((line) => `postNormalize:${line}`),
+        )
+        const poolUtil = await getSahPool(sqlite3)
+        activeVfs = 'opfs-sahpool'
+        storageMode = 'opfs-sahpool'
+        storageDetail =
+          'SharedArrayBuffer-backed OPFS was unavailable, so the shared worker installed SQLite’s OPFS SAH pool VFS instead.'
+        activeDb = new poolUtil.OpfsSAHPoolDb(toSahPoolPath(filename))
+      } catch (error) {
+        activeVfs = 'memdb'
+        storageMode = 'memory'
+        storageDetail =
+          'Both OPFS VFS options were unavailable. Falling back to an in-memory database for this session. ' +
+          getErrorMessage(error)
+        diagnostics.push(`sahpoolError=${getErrorMessage(error)}`)
+        activeDb = new sqlite3.oo1.DB(':memory:', 'ct')
+      }
     }
+
+    activeFilename = filename
+  } else {
+    diagnostics.push('reusedExistingConnection=true')
   }
 
   activeDb.exec(bootstrapSql)
 
   return {
+    connectedClients: connectedPorts.size,
     diagnostics,
     filename: activeDb.filename,
     persistent: storageMode !== 'memory',
+    runtime: 'shared-worker',
     storageDetail,
     storageMode,
     version: sqlite3.version.libVersion,
@@ -297,7 +247,29 @@ async function executeSql({ sql }: ExecPayload): Promise<ExecResult> {
   }
 }
 
-async function handleMessage(message: WorkerIncoming) {
+function enqueueRequest<T>(work: () => Promise<T>) {
+  const queued = requestQueue.then(work, work)
+  requestQueue = queued.then(
+    () => undefined,
+    () => undefined,
+  )
+  return queued
+}
+
+function disconnectPort(port: MessagePort) {
+  const deleted = connectedPorts.delete(port)
+
+  if (connectedPorts.size === 0) {
+    closeDatabase()
+  }
+
+  return deleted
+}
+
+async function handleMessage(
+  message: SqliteIncoming,
+  port: MessagePort,
+): Promise<SqliteResponseMap[keyof SqliteResponseMap]> {
   switch (message.type) {
     case 'init':
       return await initializeDatabase(message.payload)
@@ -307,28 +279,44 @@ async function handleMessage(message: WorkerIncoming) {
       return {
         closed: closeDatabase(),
       }
+    case 'disconnect':
+      return {
+        disconnected: disconnectPort(port),
+      }
   }
 }
 
-globalThis.addEventListener(
-  'message',
-  async (event: MessageEvent<WorkerIncoming>) => {
-    const message = event.data
+globalThis.addEventListener('connect', (event: Event) => {
+  const connectEvent = event as MessageEvent
+  const [port] = connectEvent.ports
 
-    try {
-      const result = await handleMessage(message)
+  if (!port) {
+    return
+  }
 
-      globalThis.postMessage({
-        id: message.id,
-        result,
-        success: true,
-      } satisfies WorkerSuccess<keyof WorkerResponseMap>)
-    } catch (error) {
-      globalThis.postMessage({
-        error: getErrorMessage(error),
-        id: message.id,
-        success: false,
-      } satisfies WorkerFailure)
-    }
-  },
-)
+  connectedPorts.add(port)
+  port.start()
+  port.addEventListener('message', (messageEvent: MessageEvent<SqliteIncoming>) => {
+    const message = messageEvent.data
+
+    void enqueueRequest(() => handleMessage(message, port))
+      .then((result) => {
+        port.postMessage({
+          id: message.id,
+          result,
+          success: true,
+        } satisfies SqliteSuccess<keyof SqliteResponseMap>)
+
+        if (message.type === 'disconnect') {
+          port.close()
+        }
+      })
+      .catch((error) => {
+        port.postMessage({
+          error: getErrorMessage(error),
+          id: message.id,
+          success: false,
+        } satisfies SqliteFailure)
+      })
+  })
+})

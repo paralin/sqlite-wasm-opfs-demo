@@ -1,48 +1,19 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import './App.css'
-
-type SqlCell =
-  | string
-  | number
-  | bigint
-  | null
-  | Uint8Array
-  | Int8Array
-  | ArrayBuffer
-
-type ResultRow = Record<string, SqlCell>
-
-type StorageMode = 'memory' | 'opfs' | 'opfs-sahpool'
-
-type InitPayload = {
-  bootstrapSql: string
-  filename: string
-}
-
-type InitResult = {
-  diagnostics: string[]
-  filename: string
-  persistent: boolean
-  storageDetail: string | null
-  storageMode: StorageMode
-  version: string
-  vfs: string
-  vfsList: string[]
-}
-
-type ExecPayload = {
-  sql: string
-}
-
-type ExecResult = {
-  changeCount: number
-  columns: string[]
-  elapsedMs: number
-  lastInsertRowId: bigint | null
-  rowCount: number
-  rows: ResultRow[]
-}
+import type {
+  ExecPayload,
+  ExecResult,
+  InitPayload,
+  InitResult,
+  SqlCell,
+  SqliteFailure,
+  SqliteRequest,
+  SqliteRequestMap,
+  SqliteResponseMap,
+  SqliteSuccess,
+  StorageMode,
+} from './sqlite-protocol'
 
 type ConnectionState = InitResult & {
   crossOriginIsolated: boolean
@@ -52,40 +23,9 @@ type ExecutionSummary = ExecResult & {
   sql: string
 }
 
-type WorkerRequestMap = {
-  close: Record<string, never>
-  exec: ExecPayload
-  init: InitPayload
-}
-
-type WorkerResponseMap = {
-  close: {
-    closed: boolean
-  }
-  exec: ExecResult
-  init: InitResult
-}
-
-type WorkerRequest<K extends keyof WorkerRequestMap> = {
-  id: number
-  payload: WorkerRequestMap[K]
-  type: K
-}
-
-type WorkerSuccess<K extends keyof WorkerResponseMap> = {
-  id: number
-  result: WorkerResponseMap[K]
-  success: true
-}
-
-type WorkerFailure = {
-  error: string
-  id: number
-  success: false
-}
-
 type SqliteWorkerClient = {
-  close: () => Promise<WorkerResponseMap['close']>
+  close: () => Promise<SqliteResponseMap['close']>
+  disconnect: () => Promise<SqliteResponseMap['disconnect']>
   exec: (payload: ExecPayload) => Promise<ExecResult>
   init: (payload: InitPayload) => Promise<InitResult>
   terminate: () => void
@@ -104,7 +44,7 @@ const BOOTSTRAP_SQL = `
   );
 
   INSERT OR IGNORE INTO demo_tasks (title, status, priority, details) VALUES
-    ('Warm OPFS cache', 'ready', 3, 'Confirms the worker-backed database opens from OPFS.'),
+    ('Warm OPFS cache', 'ready', 3, 'Confirms the shared-worker-backed database opens from OPFS.'),
     ('Inspect persistence', 'active', 5, 'Reload the page and the table stays put.'),
     ('Run ad hoc SQL', 'queued', 2, 'Use the editor below to query or mutate the database.');
 `
@@ -183,9 +123,22 @@ function getErrorMessage(error: unknown) {
 }
 
 function createSqliteWorkerClient(): SqliteWorkerClient {
-  const worker = new Worker(new URL('./sqlite-worker.ts', import.meta.url), {
-    type: 'module',
-  })
+  if (typeof SharedWorker === 'undefined') {
+    throw new Error(
+      'SharedWorker is unavailable in this browser, so the shared SQLite runtime cannot start.',
+    )
+  }
+
+  const worker = new SharedWorker(
+    new URL('./sqlite-shared-worker.ts', import.meta.url),
+    {
+      name: 'sqlite-opfs-shared-worker',
+      type: 'module',
+    },
+  )
+  const { port } = worker
+  port.start()
+  let isTerminated = false
   let nextId = 1
   const pending = new Map<
     number,
@@ -203,10 +156,10 @@ function createSqliteWorkerClient(): SqliteWorkerClient {
     pending.clear()
   }
 
-  worker.addEventListener('message', (event) => {
+  port.addEventListener('message', (event) => {
     const message = event.data as
-      | WorkerSuccess<keyof WorkerResponseMap>
-      | WorkerFailure
+      | SqliteSuccess<keyof SqliteResponseMap>
+      | SqliteFailure
     const current = pending.get(message.id)
 
     if (!current) {
@@ -223,36 +176,52 @@ function createSqliteWorkerClient(): SqliteWorkerClient {
     current.reject(new Error(message.error))
   })
 
-  worker.addEventListener('error', (event) => {
-    rejectAll(event.message || 'SQLite worker crashed.')
+  port.addEventListener('messageerror', () => {
+    rejectAll('Shared SQLite worker emitted an unreadable message.')
   })
 
-  const request = <K extends keyof WorkerRequestMap>(
+  const request = <K extends keyof SqliteRequestMap>(
     type: K,
-    payload: WorkerRequestMap[K],
+    payload: SqliteRequestMap[K],
   ) =>
-    new Promise<WorkerResponseMap[K]>((resolve, reject) => {
+    new Promise<SqliteResponseMap[K]>((resolve, reject) => {
+      if (isTerminated) {
+        reject(new Error('SQLite shared worker connection is closed.'))
+        return
+      }
+
       const id = nextId++
 
       pending.set(id, {
         reject,
-        resolve: (value) => resolve(value as WorkerResponseMap[K]),
+        resolve: (value) => resolve(value as SqliteResponseMap[K]),
       })
 
-      worker.postMessage({
+      port.postMessage({
         id,
         payload,
         type,
-      } satisfies WorkerRequest<K>)
+      } satisfies SqliteRequest<K>)
     })
 
   return {
     close: () => request('close', {}),
+    disconnect: () => request('disconnect', {}),
     exec: (payload) => request('exec', payload),
     init: (payload) => request('init', payload),
     terminate: () => {
-      rejectAll('SQLite worker terminated.')
-      worker.terminate()
+      if (isTerminated) {
+        return
+      }
+
+      port.postMessage({
+        id: -1,
+        payload: {},
+        type: 'disconnect',
+      } satisfies SqliteRequest<'disconnect'>)
+      rejectAll('SQLite shared worker connection closed.')
+      isTerminated = true
+      port.close()
     },
   }
 }
@@ -308,7 +277,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false
-    const nextClient = createSqliteWorkerClient()
+    let nextClient: SqliteWorkerClient | null = null
 
     const appendLog = (message: string) => {
       const stamp = new Date().toLocaleTimeString([], {
@@ -322,9 +291,10 @@ function App() {
 
     const boot = async () => {
       setIsBooting(true)
-      appendLog('Initializing the SQLite worker.')
+      appendLog('Initializing the shared SQLite worker.')
 
       try {
+        nextClient = createSqliteWorkerClient()
         const init = await nextClient.init({
           bootstrapSql: BOOTSTRAP_SQL,
           filename: DB_FILENAME,
@@ -341,7 +311,7 @@ function App() {
         })
 
         appendLog(
-          `Opened ${init.filename} using ${formatStorageMode(init.storageMode)} (${init.vfs}).`,
+          `Opened ${init.filename} in the shared worker using ${formatStorageMode(init.storageMode)} (${init.vfs}).`,
         )
 
         setIsRunning(true)
@@ -375,8 +345,7 @@ function App() {
 
     return () => {
       cancelled = true
-      void nextClient.close().catch(() => undefined)
-      nextClient.terminate()
+      nextClient?.terminate()
     }
   }, [])
 
@@ -409,10 +378,12 @@ function App() {
           <p className="eyebrow">SQLite Wasm + OPFS</p>
           <h1>Browser-persisted SQL on top of Origin Private File System</h1>
           <p className="lede">
-            A compact query runner for a worker-backed SQLite database stored in
+            A compact query runner for a shared-worker-backed SQLite database
+            stored in
             <code> {DB_FILENAME} </code>
             so data survives page reloads, with automatic fallback to the OPFS
-            SAH pool on browsers without `SharedArrayBuffer`.
+            SAH pool on browsers without `SharedArrayBuffer`, while reusing one
+            SQLite runtime across tabs.
           </p>
         </div>
         <div className="meta-grid">
@@ -420,7 +391,7 @@ function App() {
             <span className="meta-label">Engine</span>
             <strong>{connection?.version ?? 'Starting...'}</strong>
             <span className="meta-hint">
-              {connection ? `${connection.vfs} VFS` : 'Worker boot sequence'}
+              {connection ? `${connection.vfs} VFS` : 'Shared worker boot sequence'}
             </span>
           </article>
           <article className="meta-card">
@@ -599,6 +570,14 @@ function App() {
                   </dd>
                 </div>
                 <div>
+                  <dt>Runtime</dt>
+                  <dd>{connection?.runtime ?? 'Starting...'}</dd>
+                </div>
+                <div>
+                  <dt>Connected clients</dt>
+                  <dd>{connection?.connectedClients ?? '...'}</dd>
+                </div>
+                <div>
                   <dt>Known VFS list</dt>
                   <dd>{connection?.vfsList.join(', ') ?? 'Loading...'}</dd>
                 </div>
@@ -609,13 +588,18 @@ function App() {
               <p className="panel-kicker">Fallback</p>
               <h2>Persistence behavior</h2>
               <p className="body-copy">
-                The worker prefers the standard
+                The shared worker prefers the standard
                 <code> opfs </code>
                 VFS when available. If that VFS is missing, it attempts to
                 install and use
                 <code> opfs-sahpool </code>
                 so OPFS persistence still works on browsers that do not expose
                 `SharedArrayBuffer`.
+              </p>
+              <p className="body-copy">
+                All tabs connected to this origin share one SQLite connection,
+                so initialization and query execution are funneled through a
+                single worker queue.
               </p>
               {connection?.storageDetail ? (
                 <p className="body-copy">{connection.storageDetail}</p>
@@ -624,9 +608,9 @@ function App() {
 
             <section className="subpanel">
               <p className="panel-kicker">Diagnostics</p>
-              <h2>Worker capability report</h2>
+              <h2>Shared worker capability report</h2>
               <ul className="log-list">
-                {(connection?.diagnostics ?? ['Loading worker diagnostics...']).map(
+                {(connection?.diagnostics ?? ['Loading shared worker diagnostics...']).map(
                   (entry) => (
                     <li key={entry}>{entry}</li>
                   ),
